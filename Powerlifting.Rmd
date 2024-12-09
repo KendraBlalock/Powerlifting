@@ -1,0 +1,208 @@
+---
+title: "Neural Gains: Benchmarks and Barbells"
+output: html_document
+date: "2024-12-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+### Determine the Goal
+I have heard so much about neural nets so I decided to give one a try. This is to be my initial taste, knowing there is so much to learn and explore.  
+
+### Acquire Some Data
+I downloaded publicly accessible powerlifting competition results found  [here](https://openpowerlifting.gitlab.io/opl-csv/introduction.html). 
+
+
+### Review and Understand 
+The download comes with an excellent Readme file. The first order of business was to review the time frame and select the years I wanted to work with. 
+```{r prepdata}
+#load libraries
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(forecast)
+library(fpp3)
+library(randomForest)
+library(keras)
+
+#load data
+lift_data <- read.csv("openpowerlifting-2024-11-09-128b465c.csv")
+
+#review variable names 
+names(lift_data)
+
+#review data
+head(lift_data, 10)
+
+#date range 
+lift_data %>% 
+  summarise(start= min(Date),
+            end = max(Date))
+
+#exploring the date range to determine appropriate cut off 
+lift_data %>% mutate(year = year(lift_data$Date)) %>% group_by(year) %>% count() %>% 
+  ggplot(aes(x = year, y = n)) +
+  geom_col()
+
+```
+
+### Consider the Correlations
+Since this data set does not contain many features, I planned to include them all in the neural net. However, I was curious to see how the features related to the target variable and to each other. For this investigation, I selected the deadlift weight as the target variable. 
+
+```{r corr}
+#narrow down lift_data to records with Best3DeadliftKg present
+#select variables for correlations and keep only complete records
+#narrow to records 2020 and later
+deadlift <- lift_data %>% 
+  mutate(Year= year(ymd(lift_data$Date))) %>% 
+  select(Name, Sex, Equipment, Age, BodyweightKg, Best3DeadliftKg, Year) %>% 
+  filter(complete.cases(.) &
+           Year >= 2010) 
+
+#correlation for the continious variables
+cor(deadlift[, c('Age','BodyweightKg', 'Best3DeadliftKg', 'Year')])
+
+#correlation for the categorial variables
+cat_vars <- c("Sex", "Equipment")
+
+# Loop to run ANOVA for each categorical variable
+for (var in cat_vars) {
+  formula <- as.formula(paste("Best3DeadliftKg ~", var)) 
+  anova_result <- aov(formula, data = deadlift)    
+  print(summary(anova_result))                
+}
+
+```
+I also ran a random forest model to see the importance of each feature in a traditional machine learning approach. 
+
+```{r random_forest}
+#turn categorical variables into factors
+deadlift$Sex <- as.factor(deadlift$Sex)
+deadlift$Equipment <- as.factor(deadlift$Equipment)
+
+#build RF model
+set.seed(555)  # For reproducibility
+
+library(ranger)
+
+rf_model <- ranger(Best3DeadliftKg ~ Sex + Equipment + Age + BodyweightKg, 
+                   data = deadlift,
+                   num.trees = 100, 
+                   importance = "impurity")
+
+
+# View the model summary
+print(rf_model)
+importance(rf_model) 
+```
+
+### Get Personal
+Instead of just running the training and tests sets, I wanted to see what the model would predict for me. What kind of weight should I expect to deadlift if I was a powerlifter given my current age, sex, and weight. 
+
+I uploaded my own information to merge with the main dataset before training so that the record's values could also be normalized with the main dataset. Below, you can see that the record is then set aside when the training and test sets are selected. 
+
+```{r personal_data}
+#upload personal data points for imputation at last step
+personal_data <- read.csv("personal_data_points.csv", 
+                          colClasses = c("character", "character", "character", 
+                                         "numeric", "numeric",
+                                         "numeric", "numeric"))
+
+deadlift <- deadlift %>% bind_rows(personal_data)
+
+```
+
+### Prepare the Data
+To run the neural net, I setup dummy categorical variables, normalized the continuous variables, and split the data into training and test sets. 
+
+```{r prepdata2}
+# setup dummy categorical variables
+deadlift2 <- model.matrix(~ Sex + Equipment - 1, data = deadlift) %>%
+  cbind(deadlift[, c("Age", "BodyweightKg", "Year", "Best3DeadliftKg")]) 
+
+# setup predictors (X) and target (y)
+X <- as.matrix(deadlift2[, -ncol(deadlift2)])  #exclude Best3DeadliftKg
+y <- deadlift2[, ncol(deadlift2)]
+
+# Normalize continuous variables
+normalize <- function(x) (x - min(x)) / (max(x) - min(x))
+X <- apply(X, 2, normalize)
+
+# Pull out personal data stored in the last row for prediction later
+X_personal <- X[nrow(X), ]
+
+X <-  X[-nrow(X), ]
+y <- y[-length(y)]
+
+# Split data into training and testing
+set.seed(777)
+# 80% for training
+train_index <- sample(1:nrow(X), 0.8 * nrow(X))  
+X_train <- X[train_index, ]
+y_train <- y[train_index]
+X_test <- X[-train_index, ]
+y_test <- y[-train_index]
+
+```
+
+### Run the Neural Net
+```{r nn}
+# Build a neural network model
+model <- keras_model_sequential() %>%
+         layer_dense(units = 16, 
+                     activation = "relu", 
+                     input_shape = ncol(X_train)) %>% 
+         layer_dense(units = 8, 
+                     activation = "relu") %>% 
+         layer_dense(units = 1, 
+                     activation = "linear")  
+
+# Compile the model
+model %>% compile(loss = "mse",
+                  optimizer = "adam",
+                  metrics = c("mae"))
+
+#define cut off for stopping when no improvement is seen
+early_stop <- callback_early_stopping(
+  monitor = "val_loss",  
+  patience = 5,           
+  restore_best_weights = TRUE  
+)
+
+# Train the model
+history <- model %>% fit(
+  X_train, y_train,
+  epochs = 50,
+  batch_size = 16,
+  validation_split = 0.2,
+  callbacks = list(early_stop)
+)
+
+plot(history)
+
+# Evaluate the model
+score <- model %>% evaluate(X_test, y_test)
+print(score)
+
+```
+
+### Predict my Deadlift
+```{r predict}
+
+X_personal_matrix <- t(as.matrix(X_personal))
+
+my_deadlift <- model %>% predict(X_personal_matrix)
+
+print(paste(round(my_deadlift,0), "kg"))
+print(paste(round(my_deadlift*2.20462262185,0), "lbs"))
+
+```
+330lbs is no joke. I will clearly need to hit the gym a bit more if I ever wanted to compete, but it is kind of cool to see what is even remotely possible. 
+
+Note: This page uses data from the OpenPowerlifting project, https://www.openpowerlifting.org.
+You may download a copy of the data at https://data.openpowerlifting.org.
+
